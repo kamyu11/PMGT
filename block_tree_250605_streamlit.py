@@ -4,6 +4,10 @@ from openpyxl import load_workbook
 import xlrd
 import re
 import io
+import tempfile
+import os
+import xlwings as xw
+from collections import namedtuple
 
 st.set_page_config(page_title='부모-자식 관계 추출기', layout='wide')
 
@@ -19,78 +23,74 @@ st.markdown(
 
 uploaded_file = st.file_uploader(
     '분석할 Excel 파일 선택 (.xlsx 또는 .xls)',
-    type=['xlsx','xls']
+    type=['xlsx', 'xls']
 )
 
 if uploaded_file is not None:
-    st.success("✅ 파일 업로드 완료")
+    st.success('✅ 파일 업로드 완료')
     content = uploaded_file.read()
     file_ext = uploaded_file.name.lower().split('.')[-1]
-    st.write(f"파일 확장자: {file_ext}")
+    st.write(f'파일 확장자: {file_ext}')
 
     if st.button('변환'):
         try:
-            st.info("📥 엑셀 파일 읽기 시작...")
-            if file_ext == 'xlsx':
-                df_full = pd.read_excel(
-                    io.BytesIO(content),
-                    sheet_name=1,
-                    header=None,
-                    engine='openpyxl'
-                )
-                wb_temp = load_workbook(io.BytesIO(content), data_only=True)
-                ws_temp = wb_temp.worksheets[1]
-                merged_ranges = list(ws_temp.merged_cells.ranges)
-            elif file_ext == 'xls':
-                book_temp = xlrd.open_workbook(file_contents=content, formatting_info=True)
-                sheet_temp = book_temp.sheet_by_index(1)
-                merged_ranges = sheet_temp.merged_cells
-                df_full = pd.read_excel(
-                    io.BytesIO(content),
-                    sheet_name=1,
-                    header=None,
-                    engine='xlrd'
-                )
-            else:
-                st.error('❌ 지원되지 않는 파일 형식입니다.')
-                st.stop()
+            st.info('📥 엑셀 파일 읽기 시작...')
 
-            st.success("✅ 엑셀 파일 읽기 완료")
+            # DRM 우회: xlwings로 백그라운드에서 열기
+            suffix = f'.{file_ext}'
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_file:
+                tmp_file.write(content)
+                tmp_path = tmp_file.name
 
+            app = xw.App(visible=False)
+            wb = xw.Book(tmp_path)
+            ws = wb.sheets[1]  # 두 번째 시트
+
+            # DataFrame으로 읽기
+            df_full = ws.used_range.options(pd.DataFrame, index=False).value
+
+            # 병합 셀 정보 추출
+            MergeRange = namedtuple('MergeRange', 'bounds')
+            merged_ranges = []
+            try:
+                for area in ws.api.UsedRange.MergeAreas:
+                    bounds = (
+                        area.Column,
+                        area.Row,
+                        area.Column + area.Columns.Count - 1,
+                        area.Row + area.Rows.Count - 1
+                    )
+                    merged_ranges.append(MergeRange(bounds))
+            except Exception:
+                merged_ranges = []
+
+            app.kill()
+            os.remove(tmp_path)
+
+            st.success('✅ 엑셀 파일 읽기 완료')
+
+            # 기존 변환 로직
             START_ROW_IDX = 4
             df_data = df_full.iloc[START_ROW_IDX:].reset_index(drop=True)
             df_data.columns = [f'COLUMN{i+1}' for i in range(df_data.shape[1])]
-            st.write("데이터 shape:", df_data.shape)
+            st.write('데이터 shape:', df_data.shape)
 
             def fill_merged_cells(df, merged_ranges, is_xlsx=True):
                 for mr in merged_ranges:
-                    if is_xlsx:
-                        min_col, min_row, max_col, max_row = mr.bounds
-                        start_r = min_row - 1 - START_ROW_IDX
-                        end_r   = max_row - 1 - START_ROW_IDX
-                        start_c = min_col - 1
-                        if not (0 <= start_r < len(df) and 0 <= start_c < df.shape[1]):
-                            continue
-                        top_val = df.iat[start_r, start_c]
-                        for rr in range(start_r, end_r+1):
-                            for cc in range(start_c, max_col):
-                                if 0 <= rr < len(df) and 0 <= cc < df.shape[1]:
-                                    df.iat[rr, cc] = top_val
-                    else:
-                        rlo, rhi, clo, chi = mr
-                        start_r = rlo - START_ROW_IDX
-                        end_r   = (rhi - 1) - START_ROW_IDX
-                        start_c = clo
-                        if not (0 <= start_r < len(df) and 0 <= start_c < df.shape[1]):
-                            continue
-                        top_val = df.iat[start_r, start_c]
-                        for rr in range(start_r, end_r+1):
-                            for cc in range(start_c, chi):
-                                if 0 <= rr < len(df) and 0 <= cc < df.shape[1]:
-                                    df.iat[rr, cc] = top_val
+                    min_col, min_row, max_col, max_row = mr.bounds
+                    start_r = min_row - 1 - START_ROW_IDX
+                    end_r = max_row - 1 - START_ROW_IDX
+                    start_c = min_col - 1
+                    if not (0 <= start_r < len(df) and 0 <= start_c < df.shape[1]):
+                        continue
+                    top_val = df.iat[start_r, start_c]
+                    for rr in range(start_r, end_r+1):
+                        for cc in range(start_c, max_col):
+                            if 0 <= rr < len(df) and 0 <= cc < df.shape[1]:
+                                df.iat[rr, cc] = top_val
 
-            fill_merged_cells(df_data, merged_ranges, is_xlsx=(file_ext == 'xlsx'))
-            st.success("✅ 병합 셀 값 채우기 완료")
+            fill_merged_cells(df_data, merged_ranges)
+            st.success('✅ 병합 셀 값 채우기 완료')
 
             rows = []
 
@@ -100,7 +100,7 @@ if uploaded_file is not None:
                 txt = re.sub(r'[()\s\n]', '', str(val))
                 return txt[:5]
 
-            parent_columns = ['COLUMN6','COLUMN5','COLUMN4','COLUMN3','COLUMN2','COLUMN1']
+            parent_columns = ['COLUMN6', 'COLUMN5', 'COLUMN4', 'COLUMN3', 'COLUMN2', 'COLUMN1']
 
             for _, row in df_data.iterrows():
                 raw_child = row.get('COLUMN7')
@@ -149,14 +149,14 @@ if uploaded_file is not None:
                     if parent:
                         rows.append({'부모': parent, '자식': child})
 
-            extract_parent_child(df_data, 'COLUMN6', ['COLUMN5','COLUMN4','COLUMN3','COLUMN2','COLUMN1'])
-            extract_parent_child(df_data, 'COLUMN5', ['COLUMN4','COLUMN3','COLUMN2','COLUMN1'])
-            extract_parent_child(df_data, 'COLUMN4', ['COLUMN3','COLUMN2','COLUMN1'])
-            extract_parent_child(df_data, 'COLUMN3', ['COLUMN2','COLUMN1'])
+            extract_parent_child(df_data, 'COLUMN6', ['COLUMN5', 'COLUMN4', 'COLUMN3', 'COLUMN2', 'COLUMN1'])
+            extract_parent_child(df_data, 'COLUMN5', ['COLUMN4', 'COLUMN3', 'COLUMN2', 'COLUMN1'])
+            extract_parent_child(df_data, 'COLUMN4', ['COLUMN3', 'COLUMN2', 'COLUMN1'])
+            extract_parent_child(df_data, 'COLUMN3', ['COLUMN2', 'COLUMN1'])
             extract_parent_child(df_data, 'COLUMN2', ['COLUMN1'])
 
             result_df = pd.DataFrame(rows).drop_duplicates().reset_index(drop=True)
-            st.success("✅ 부모-자식 관계 추출 완료")
+            st.success('✅ 부모-자식 관계 추출 완료')
             st.subheader('📊 추출된 부모-자식 관계')
             st.dataframe(result_df)
 
